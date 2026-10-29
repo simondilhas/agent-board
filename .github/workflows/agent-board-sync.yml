@@ -31,8 +31,14 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      HAS_TOKEN: ${{ secrets.PROJECT_TOKEN != '' }}
     steps:
-      - uses: actions/github-script@v7
+      - name: Skip until PROJECT_TOKEN is set
+        if: env.HAS_TOKEN != 'true'
+        run: echo "PROJECT_TOKEN secret missing, nothing to do."
+      - if: env.HAS_TOKEN == 'true'
+        uses: actions/github-script@v7
         env:
           PROJECT_OWNER: simondilhas
           PROJECT_NUMBER: "7"
