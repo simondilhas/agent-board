@@ -1,0 +1,162 @@
+# Two-way sync between agent labels and the Status column of the Roadmap board.
+#
+#   Status column   <->  label
+#   Backlog              (no agent label)
+#   Ready                agent_ready      drag a card here to start the agent
+#   In progress          agent_working
+#   Review               agent_finished   (a linked PR also moves it here)
+#   Done                 issue closed     (handled by the board's own automations)
+#
+# Board -> labels (drag and drop):
+#   dragged to Ready    -> adds agent_ready
+#   dragged to Backlog  -> removes agent_ready (cancel before the agent starts)
+# Labels -> board: whenever the agent labels change, the card follows.
+# If both changed since the last run, the labels win.
+#
+# Setup: repo secret PROJECT_TOKEN = classic personal access token with scopes `repo` and `project`.
+# The first run only records the current state and changes nothing.
+
+name: Agent board sync
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: agent-board-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          PROJECT_OWNER: simondilhas
+          PROJECT_NUMBER: "7"
+          SEARCH_SCOPES: "user:simondilhas org:pragmaticBIM"
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const STAGES = {
+              ready:   { status: 'Ready',       labels: ['agent_ready', 'agent-ready'] },
+              working: { status: 'In progress', labels: ['agent_working', 'agent-working'] },
+              review:  { status: 'Review',      labels: ['agent_finished'] },
+            };
+            const ORDER = ['ready', 'working', 'review'];          // later wins
+            const ALL_AGENT_LABELS = ORDER.flatMap(s => STAGES[s].labels);
+            const SYNC_FIELD = 'Agent sync';                        // hidden memory of the last synced stage
+
+            const stageFromLabels = names => {
+              let st = 'none';
+              for (const s of ORDER) if (STAGES[s].labels.some(l => names.includes(l))) st = s;
+              return st;
+            };
+
+            // ---------- project, Status field, memory field ----------
+            const owner = process.env.PROJECT_OWNER, number = Number(process.env.PROJECT_NUMBER);
+            const p = (await github.graphql(
+              `query($o:String!,$n:Int!){ user(login:$o){ projectV2(number:$n){ id
+                 fields(first:50){ nodes{ __typename ... on ProjectV2FieldCommon{ id name }
+                   ... on ProjectV2SingleSelectField{ options{ id name } } } } } } }`,
+              { o: owner, n: number })).user.projectV2;
+            const projectId = p.id;
+            const statusField = p.fields.nodes.find(f => f.name === 'Status');
+            const optionId = name => {
+              const o = statusField.options.find(x => x.name === name);
+              if (!o) throw new Error(`Status option "${name}" missing on the board`);
+              return o.id;
+            };
+            let syncField = p.fields.nodes.find(f => f.name === SYNC_FIELD);
+            if (!syncField) {
+              syncField = (await github.graphql(
+                `mutation($p:ID!,$n:String!){ createProjectV2Field(input:{projectId:$p,dataType:TEXT,name:$n}){
+                   projectV2Field{ ... on ProjectV2FieldCommon{ id name } } } }`,
+                { p: projectId, n: SYNC_FIELD })).createProjectV2Field.projectV2Field;
+              core.info(`Created hidden field "${SYNC_FIELD}"`);
+            }
+
+            // ---------- helpers ----------
+            const setStatus = (itemId, name) => github.graphql(
+              `mutation($p:ID!,$i:ID!,$f:ID!,$o:String!){ updateProjectV2ItemFieldValue(input:{
+                 projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$o}}){ clientMutationId } }`,
+              { p: projectId, i: itemId, f: statusField.id, o: optionId(name) });
+            const setMemory = (itemId, val) => github.graphql(
+              `mutation($p:ID!,$i:ID!,$f:ID!,$v:String!){ updateProjectV2ItemFieldValue(input:{
+                 projectId:$p,itemId:$i,fieldId:$f,value:{text:$v}}){ clientMutationId } }`,
+              { p: projectId, i: itemId, f: syncField.id, v: val });
+
+            // ---------- load all board items ----------
+            const items = [];
+            let after = null;
+            do {
+              const r = (await github.graphql(
+                `query($id:ID!,$a:String){ node(id:$id){ ... on ProjectV2 { items(first:100, after:$a){
+                   pageInfo{ hasNextPage endCursor }
+                   nodes{ id
+                     status: fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ name } }
+                     memory: fieldValueByName(name:"${SYNC_FIELD}"){ ... on ProjectV2ItemFieldTextValue{ text } }
+                     content{ __typename ... on Issue{ id number state
+                       repository{ name owner{ login } } labels(first:50){ nodes{ name } } } } } } } } }`,
+                { id: projectId, a: after })).node.items;
+              items.push(...r.nodes);
+              after = r.pageInfo.hasNextPage ? r.pageInfo.endCursor : null;
+            } while (after);
+            const onBoard = new Set(items.filter(i => i.content?.id).map(i => i.content.id));
+
+            // ---------- add labeled issues that are not on the board yet ----------
+            let added = 0;
+            for (const scope of process.env.SEARCH_SCOPES.split(/\s+/)) {
+              const q = `is:issue is:open label:${ALL_AGENT_LABELS.join(',')} ${scope}`;
+              const found = await github.paginate(github.rest.search.issuesAndPullRequests, { q, per_page: 100 });
+              for (const issue of found) {
+                if (onBoard.has(issue.node_id)) continue;
+                const st = stageFromLabels(issue.labels.map(l => l.name));
+                if (st === 'none') continue;
+                const itemId = (await github.graphql(
+                  `mutation($p:ID!,$c:ID!){ addProjectV2ItemById(input:{projectId:$p,contentId:$c}){ item{ id } } }`,
+                  { p: projectId, c: issue.node_id })).addProjectV2ItemById.item.id;
+                await setStatus(itemId, STAGES[st].status);
+                await setMemory(itemId, st);
+                onBoard.add(issue.node_id);
+                added++;
+              }
+            }
+
+            // ---------- two-way sync ----------
+            let toBoard = 0, toLabels = 0;
+            for (const it of items) {
+              const c = it.content;
+              if (!c || c.__typename !== 'Issue' || c.state !== 'OPEN') continue;
+              const names = c.labels.nodes.map(l => l.name);
+              const L = stageFromLabels(names);            // what the labels say
+              const S = it.status?.name ?? null;           // where the card is
+              const P = it.memory?.text || null;           // what we synced last time
+              const repo = { owner: c.repository.owner.login, repo: c.repository.name, issue_number: c.number };
+
+              if (P === null) {                            // first sight: record, don't trigger anything
+                if (L !== 'none' && S !== STAGES[L].status) { await setStatus(it.id, STAGES[L].status); toBoard++; }
+                await setMemory(it.id, L);
+                continue;
+              }
+
+              if (L !== P) {                               // labels changed -> card follows
+                if (L !== 'none') { if (S !== STAGES[L].status) { await setStatus(it.id, STAGES[L].status); toBoard++; } }
+                else if (S === 'Ready' || S === 'In progress') { await setStatus(it.id, 'Backlog'); toBoard++; }
+                await setMemory(it.id, L);
+              } else if (S === 'Ready' && L === 'none') {  // dragged to Ready -> start agent
+                await github.rest.issues.addLabels({ ...repo, labels: ['agent_ready'] });
+                await setMemory(it.id, 'ready');
+                toLabels++;
+              } else if (S === 'Backlog' && L === 'ready') { // dragged back -> cancel
+                for (const l of STAGES.ready.labels.filter(x => names.includes(x))) {
+                  await github.rest.issues.removeLabel({ ...repo, name: l });
+                }
+                await setMemory(it.id, 'none');
+                toLabels++;
+              }
+            }
+
+            core.info(`Added ${added} issue(s), moved ${toBoard} card(s), changed labels on ${toLabels} issue(s).`);
